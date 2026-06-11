@@ -90,14 +90,31 @@ class HiRadixCache(RadixCache):
             # Filled by attach_hybrid_dsa_pool_to_hiradix_cache after storage extra_config is parsed.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
-            self.token_to_kv_pool_host = MLATokenToKVPoolHost(
-                self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
-                allocator_type=server_args.hicache_storage_backend,
-            )
+            if server_args.enable_shared_mla:
+                from sglang.srt.mem_cache.shared_mla_host_kv_cache import (
+                    SharedMLATokenToKVPoolHost,
+                )
+
+                tp_rank = torch.distributed.get_rank(group=params.tp_cache_group)
+                tp_size = torch.distributed.get_world_size(group=params.tp_cache_group)
+                self.token_to_kv_pool_host = SharedMLATokenToKVPoolHost(
+                    self.kv_cache,
+                    server_args.hicache_ratio,
+                    server_args.hicache_size,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    tp_rank=tp_rank,
+                    tp_size=tp_size,
+                )
+            else:
+                self.token_to_kv_pool_host = MLATokenToKVPoolHost(
+                    self.kv_cache,
+                    server_args.hicache_ratio,
+                    server_args.hicache_size,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    allocator_type=server_args.hicache_storage_backend,
+                )
         else:
             raise ValueError("HiRadixCache only supports MHA, MLA, and DSA models")
 
@@ -164,6 +181,17 @@ class HiRadixCache(RadixCache):
             enable_storage_metrics=self.enable_storage_metrics,
             extra_metric_labels=self.extra_metric_labels,
         )
+
+        # SharedMLA: rank 0 owns shared L2, rank 1-7 read-only
+        self._is_shared_mla = server_args.enable_shared_mla and isinstance(
+            self.kv_cache, MLATokenToKVPool
+        )
+        if self._is_shared_mla:
+            self._shared_mla_tp_rank = torch.distributed.get_rank(
+                group=params.tp_cache_group
+            )
+        else:
+            self._shared_mla_tp_rank = 0
 
         # record the nodes with ongoing write through
         self.ongoing_write_through = {}
@@ -765,6 +793,22 @@ class HiRadixCache(RadixCache):
         ):
             return 0
 
+        # SharedMLA: rank 1-7 skip writing — rank 0 owns the shared slab.
+        # All ranks must still call _shared_mla_sync_host_value so the broadcast
+        # pairs up. Rank 0 writes normally and broadcasts host_indices;
+        # rank 1-7 receive the broadcast and set node.host_value.
+        # Rank 1-7 still register ongoing_write_through to keep writing_check's
+        # early-return condition consistent (it checks len(ongoing_write_through) == 0).
+        if self._is_shared_mla and self._shared_mla_tp_rank != 0:
+            host_indices = self._shared_mla_recv_host_value()
+            if host_indices is not None:
+                node.host_value = host_indices
+                self._track_write_through_node(node, len(node.key))
+                if not write_back:
+                    self.inc_lock_ref(node)
+                return len(host_indices)
+            return 0
+
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
@@ -783,7 +827,11 @@ class HiRadixCache(RadixCache):
             self._track_write_through_node(node, len(node.key))
             if not write_back:
                 self.inc_lock_ref(node)
+            if self._is_shared_mla:
+                self._shared_mla_send_host_value(host_indices)
         else:
+            if self._is_shared_mla:
+                self._shared_mla_send_host_value(None)
             return 0
 
         return len(host_indices)
@@ -791,6 +839,29 @@ class HiRadixCache(RadixCache):
     def _track_write_through_node(self, node: TreeNode, backup_len: int) -> None:
         node.write_through_pending_id = node.id
         self.ongoing_write_through[node.id] = (node, backup_len, [node])
+
+    def _shared_mla_send_host_value(self, host_indices: Optional[torch.Tensor]):
+        """Rank 0: broadcast host_indices length + data to all TP ranks."""
+        length = len(host_indices) if host_indices is not None else 0
+        length_tensor = torch.tensor([length], dtype=torch.int64, device="cuda")
+        torch.distributed.broadcast(length_tensor, src=0, group=self.tp_group)
+        if length > 0:
+            torch.distributed.broadcast(
+                host_indices.to(device="cuda", dtype=torch.int64),
+                src=0,
+                group=self.tp_group,
+            )
+
+    def _shared_mla_recv_host_value(self) -> Optional[torch.Tensor]:
+        """Rank 1-7: receive host_indices from rank 0 broadcast."""
+        length_tensor = torch.tensor([0], dtype=torch.int64, device="cuda")
+        torch.distributed.broadcast(length_tensor, src=0, group=self.tp_group)
+        length = length_tensor.item()
+        if length == 0:
+            return None
+        host_indices = torch.empty(length, dtype=torch.int64, device="cuda")
+        torch.distributed.broadcast(host_indices, src=0, group=self.tp_group)
+        return host_indices.cpu()
 
     def _replace_pending_write_through_node(
         self, old_node: TreeNode, new_nodes: List[TreeNode]
@@ -827,7 +898,10 @@ class HiRadixCache(RadixCache):
                 node.write_through_pending_id = None
             # DMA confirmed -- block is now on host.
             self._record_store_event(node, medium=StorageMedium.CPU)
-        if self.enable_storage:
+        # SharedMLA: only rank 0 writes L3 storage
+        if self.enable_storage and not (
+            self._is_shared_mla and self._shared_mla_tp_rank != 0
+        ):
             self.write_backup_storage(lock_node, backup_len)
         if release_lock:
             self.dec_lock_ref(lock_node)
@@ -905,7 +979,14 @@ class HiRadixCache(RadixCache):
                 self.write_backup(node)
 
     def writing_check(self, write_back=False):
+        shared_mla_follower = self._is_shared_mla and self._shared_mla_tp_rank != 0
+
         if write_back:
+            if shared_mla_follower:
+                # rank 1-7: no DMA events, just clear all pending entries
+                for ack_id in list(self.ongoing_write_through.keys()):
+                    self._finish_write_through_ack(ack_id, release_lock=False)
+                return
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
                 for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
@@ -922,10 +1003,14 @@ class HiRadixCache(RadixCache):
 
         finish_count = 0
         if self.pp_rank == 0:
-            for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                if not finish_event.query():
-                    break
-                finish_count += 1
+            if shared_mla_follower:
+                # rank 1-7: report INT_MAX so MIN takes rank 0's actual value
+                finish_count = 2**30
+            else:
+                for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
+                    if not finish_event.query():
+                        break
+                    finish_count += 1
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
         finish_count = finish_count_tensor.item()
@@ -933,10 +1018,16 @@ class HiRadixCache(RadixCache):
         if finish_count > 0:
             logger.debug(f"Process {finish_count} write back operations")
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
-                self._finish_write_through_ack(ack_id, release_lock=True)
+            if shared_mla_follower:
+                # rank 1-7: clear one pending entry per ack consumed by rank 0
+                if self.ongoing_write_through:
+                    ack_id = next(iter(self.ongoing_write_through))
+                    self._finish_write_through_ack(ack_id, release_lock=True)
+            else:
+                _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
+                finish_event.synchronize()
+                for ack_id in ack_list:
+                    self._finish_write_through_ack(ack_id, release_lock=True)
             finish_count -= 1
 
     def loading_check(self):
@@ -1476,12 +1567,16 @@ class HiRadixCache(RadixCache):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
     ):
+        # SharedMLA V1: L3 prefetch not yet supported for shared mode.
+        # All ranks skip to avoid all_reduce mismatch in check_prefetch_progress.
+        if self._is_shared_mla:
+            return
+
         prefetch_key = RadixKey(
             new_input_tokens,
             extra_key=last_host_node.key.extra_key,
             is_bigram=self.is_eagle,
         )
-        # align the number of fetching tokens to the page size
         prefetch_key = prefetch_key.page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
         if (
@@ -1509,7 +1604,6 @@ class HiRadixCache(RadixCache):
                     return
             else:
                 last_host_node.release_host()
-                # no sufficient host memory for prefetch
                 return
         operation = self.cache_controller.prefetch(
             req_id,

@@ -689,6 +689,8 @@ class ServerArgs:
     enable_hierarchical_cache: bool = False
     hicache_ratio: float = 2.0
     hicache_size: int = 0
+    # Shared L2 pool for MLA models (rank 0 owns the slab, other ranks read).
+    enable_shared_mla: bool = False
     hicache_write_policy: str = "write_through"
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
@@ -4183,6 +4185,12 @@ class ServerArgs:
                 "and cannot be used at the same time. Please use only one of them."
             )
 
+        if self.enable_shared_mla and not self.enable_hierarchical_cache:
+            raise ValueError(
+                "The argument enable-shared-mla requires enable-hierarchical-cache "
+                "(SharedMLA is a host-pool implementation for the hierarchical cache)."
+            )
+
         if self.disaggregation_decode_enable_offload_kvcache:
             if self.disaggregation_mode != "decode":
                 raise ValueError(
@@ -6285,6 +6293,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.hicache_size,
             help="The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
+        )
+        parser.add_argument(
+            "--enable-shared-mla",
+            action="store_true",
+            default=ServerArgs.enable_shared_mla,
+            help="Enable shared L2 KV cache pool for MLA models. Rank 0 owns the shared slab, other ranks read-only. Saves (TP-1)/TP of L2 DRAM. Requires --enable-hierarchical-cache.",
         )
         parser.add_argument(
             "--hicache-write-policy",
