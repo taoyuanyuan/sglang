@@ -2746,6 +2746,7 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
         "flashinfer",
         "mori",
         "pplx",
+        "hpc_ops",
     }
 )
 

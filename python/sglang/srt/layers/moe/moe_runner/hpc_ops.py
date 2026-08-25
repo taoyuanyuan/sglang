@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 MoE runner backend powered by HPC-Ops (https://github.com/Tencent/hpc-ops),
 a production-grade operator library for LLM inference developed by the
@@ -20,6 +18,8 @@ HPC-Ops kernels are currently tuned primarily for H20: on other SM90 GPUs
 (H100/H200) the speedup over the default MoE runner may be limited or absent.
 Enable it explicitly with ``--moe-runner-backend hpc_ops``.
 """
+
+from __future__ import annotations
 
 import functools
 import importlib.util
@@ -116,12 +116,13 @@ def _check_runner_config_supported(runner_config: MoeRunnerConfig) -> None:
     if (
         runner_config.gemm1_alpha is not None
         or runner_config.gemm1_clamp_limit is not None
-        or runner_config.swiglu_limit is not None
     ):
         raise ValueError(
-            "The hpc_ops MoE runner backend runs a plain SiLU-and-mul; it does "
-            "not support gemm1_alpha / gemm1_clamp_limit / swiglu_limit."
+            "The hpc_ops MoE runner backend supports plain or bounded SwiGLU; "
+            "it does not support gemm1_alpha / gemm1_clamp_limit."
         )
+    if runner_config.swiglu_limit is not None and runner_config.swiglu_limit < 0:
+        raise ValueError("swiglu_limit must be non-negative")
 
 
 @register_fused_func("none", "hpc_ops")
@@ -185,8 +186,13 @@ def fused_experts_none_to_hpc_ops(
             topk_weights,
             quant_info.moe_ep_rank,
             quant_info.global_num_experts,
+            swiglu_limit=float(runner_config.swiglu_limit or 0.0),
         )
     else:
+        if runner_config.swiglu_limit is not None:
+            raise ValueError(
+                "The hpc_ops per-tensor FP8 path does not support swiglu_limit."
+            )
         x_q, _ = scaled_fp8_quant(x, quant_info.w13_input_scale)
         act_and_mul_scale = 1.0 / quant_info.w2_input_scale.reshape(1)
         output = hpc.fuse_moe(
@@ -205,4 +211,39 @@ def fused_experts_none_to_hpc_ops(
     if runner_config.routed_scaling_factor is not None:
         output *= runner_config.routed_scaling_factor
 
+    return StandardCombineInput(hidden_states=output)
+
+
+@register_fused_func("hpc_ops", "hpc_ops")
+def fused_experts_hpc_ops_to_hpc_ops(
+    dispatch_output,
+    quant_info: HpcOpsMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+):
+    """Run Fused MoE from phase-selected peer-indexed W13 input."""
+
+    from sglang.srt.layers.moe.token_dispatcher.hpc_ops import HpcOpsDispatchOutput
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+
+    if not isinstance(dispatch_output, HpcOpsDispatchOutput):
+        raise TypeError("HPC-Ops peer input requires HpcOpsDispatchOutput")
+    if not isinstance(quant_info, HpcOpsMoeQuantInfo) or not quant_info.block_quant:
+        raise ValueError("HPC-Ops peer input requires block-FP8 expert weights")
+    _check_runner_config_supported(runner_config)
+    if quant_info.block_shape != [HPC_OPS_BLOCK_SIZE, HPC_OPS_BLOCK_SIZE]:
+        raise ValueError("HPC-Ops peer input requires 128x128 block quantization")
+
+    output = dispatch_output.workspace.consume(
+        w13=quant_info.w13_weight,
+        w13_scale=quant_info.w13_weight_scale_inv,
+        w2=quant_info.w2_weight,
+        w2_scale=quant_info.w2_weight_scale_inv,
+        num_experts_total=quant_info.global_num_experts,
+        tokens_per_owner=dispatch_output.tokens_per_owner,
+        local_output_rows=dispatch_output.local_output_rows,
+        pull_input=dispatch_output.pull_input,
+        swiglu_limit=float(runner_config.swiglu_limit or 0.0),
+    )
+    if runner_config.routed_scaling_factor is not None:
+        output *= runner_config.routed_scaling_factor
     return StandardCombineInput(hidden_states=output)

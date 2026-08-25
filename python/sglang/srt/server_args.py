@@ -298,6 +298,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "megamoe",
     "pplx",
     "ascend_tp",
+    "hpc_ops",
 ]
 
 MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
@@ -7482,6 +7483,19 @@ class ServerArgs:
                     "must be >= the per-rank pplx dispatch tokens "
                     "(chunked_prefill_size, or the decode cuda-graph batch size)"
                 )
+
+        if a2a_backend == "hpc_ops":
+            assert resolved_view(
+                self
+            ).enable_dp_attention, (
+                "moe_a2a_backend='hpc_ops' requires --enable-dp-attention"
+            )
+            assert (
+                resolved_view(self).moe_runner_backend == "hpc_ops"
+            ), "moe_a2a_backend='hpc_ops' requires --moe-runner-backend hpc_ops"
+            assert (
+                self.nnodes == 1
+            ), "moe_a2a_backend='hpc_ops' currently requires one NVLink host"
 
     def _required_mori_dispatch_tokens_per_rank(self) -> int:
         """Max tokens a single rank dispatches through MoRI in one forward."""

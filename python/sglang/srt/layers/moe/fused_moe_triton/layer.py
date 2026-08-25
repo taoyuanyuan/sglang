@@ -39,6 +39,7 @@ from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
+from sglang.srt.layers.moe.token_dispatcher.hpc_ops import HpcOpsDispatcher
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
 )
@@ -174,6 +175,8 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
         )
+    elif a2a_backend.is_hpc_ops():
+        return HpcOpsDispatcher(moe_runner_config)
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
 
